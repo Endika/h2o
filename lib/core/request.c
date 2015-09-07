@@ -163,7 +163,9 @@ void h2o_init_request(h2o_req_t *req, h2o_conn_t *conn, h2o_req_t *src)
     /* init properties that should be initialized to non-zero */
     req->conn = conn;
     req->_timeout_entry.cb = deferred_proceed_cb;
+    req->res.reason = "OK"; /* default to "OK" regardless of the status value, it's not important after all (never sent in HTTP2) */
     req->res.content_length = SIZE_MAX;
+    req->preferred_chunk_size = SIZE_MAX;
 
     if (src != NULL) {
 #define COPY(buf)                                                                                                                  \
@@ -233,18 +235,26 @@ void h2o_reprocess_request(h2o_req_t *req, h2o_iovec_t method, const h2o_url_sch
 
     /* reset the response */
     req->res = (h2o_res_t){0, NULL, SIZE_MAX, {}};
+    req->res.reason = "OK";
     req->_ostr_init_index = 0;
     req->bytes_sent = 0;
     memset(&req->http2_push_paths, 0, sizeof(req->http2_push_paths));
 
-    /* check the delegation counter */
-    if (is_delegated) {
+    /* check the delegation (or reprocess) counter */
+    if (req->res_is_delegated) {
         if (req->num_delegated == req->conn->ctx->globalconf->max_delegations) {
             /* TODO log */
-            h2o_send_error(req, 502, "Gateway Error", "too many internal redirections", 0);
+            h2o_send_error(req, 502, "Gateway Error", "too many internal delegations", 0);
             return;
         }
         ++req->num_delegated;
+    } else {
+        if (req->num_reprocessed >= 5) {
+            /* TODO log */
+            h2o_send_error(req, 502, "Gateway Error", "too many internal reprocesses", 0);
+            return;
+        }
+        ++req->num_reprocessed;
     }
 
     /* handle the response using the handlers, if hostconf exists */
@@ -323,6 +333,22 @@ void h2o_ostream_send_next(h2o_ostream_t *ostream, h2o_req_t *req, h2o_iovec_t *
         return;
     }
     ostream->next->do_send(ostream->next, req, bufs, bufcnt, is_final);
+}
+
+void h2o_req_fill_mime_attributes(h2o_req_t *req)
+{
+    ssize_t content_type_index;
+    h2o_mimemap_type_t *mime;
+
+    if (req->res.mime_attr != NULL)
+        return;
+
+    if ((content_type_index = h2o_find_header(&req->res.headers, H2O_TOKEN_CONTENT_TYPE, -1)) != -1 &&
+        (mime = h2o_mimemap_get_type_by_mimetype(req->pathconf->mimemap, req->res.headers.entries[content_type_index].value)) !=
+            NULL)
+        req->res.mime_attr = &mime->data.attr;
+    else
+        req->res.mime_attr = &h2o_mime_attributes_as_is;
 }
 
 void h2o_send_inline(h2o_req_t *req, const char *body, size_t len)
@@ -457,4 +483,19 @@ void h2o_send_redirect_internal(h2o_req_t *req, int status, const char *url_str,
         method = req->method;
 
     h2o_reprocess_request_deferred(req, method, url.scheme, url.authority, url.path, authority_changed ? req->overrides : NULL, 1);
+}
+
+void h2o_register_push_path_in_link_header(h2o_req_t *req, const char *value, size_t value_len)
+{
+    if (req->version < 0x200 || req->res_is_delegated)
+        return;
+
+    h2o_iovec_t path =
+        h2o_extract_push_path_from_link_header(&req->pool, value, value_len, req->input.scheme, &req->input.authority, &req->path);
+    if (path.base == NULL)
+        return;
+
+    h2o_vector_reserve(&req->pool, (h2o_vector_t *)&req->http2_push_paths, sizeof(req->http2_push_paths.entries[0]),
+                       req->http2_push_paths.size + 1);
+    req->http2_push_paths.entries[req->http2_push_paths.size++] = path;
 }

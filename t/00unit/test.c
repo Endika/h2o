@@ -19,6 +19,9 @@
  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
  * IN THE SOFTWARE.
  */
+#include "h2o.h"
+#include "h2o/configurator.h"
+#include "../../src/standalone.h"
 #include "./test.h"
 
 static void loopback_on_send(h2o_ostream_t *self, h2o_req_t *req, h2o_iovec_t *inbufs, size_t inbufcnt, int is_final)
@@ -143,6 +146,8 @@ static void test_loopback(void)
 
 int main(int argc, char **argv)
 {
+    init_openssl();
+
     { /* library tests */
         subtest("lib/common/multithread.c", test_lib__common__multithread_c);
         subtest("lib/common/hostinfo.c", test_lib__common__hostinfo_c);
@@ -158,6 +163,7 @@ int main(int argc, char **argv)
         subtest("lib/handler/mimemap.c", test_lib__handler__mimemap_c);
         subtest("lib/http2/hpack.c", test_lib__http2__hpack);
         subtest("lib/http2/scheduler.c", test_lib__http2__scheduler);
+        subtest("lib/http2/casper.c", test_lib__http2__casper);
     }
 
     { /* tests that use the run loop */
@@ -171,6 +177,7 @@ int main(int argc, char **argv)
         subtest("lib/t/test.c/loopback", test_loopback);
         subtest("lib/fastcgi.c", test_lib__handler__fastcgi_c);
         subtest("lib/file.c", test_lib__handler__file_c);
+        subtest("lib/gzip.c", test_lib__handler__gzip_c);
         subtest("lib/redirect.c", test_lib__handler__redirect_c);
         subtest("issues/293.c", test_issues293);
 
@@ -180,6 +187,10 @@ int main(int argc, char **argv)
 #else
 // h2o_evloop_destroy(loop);
 #endif
+    }
+
+    { /* src tests */
+        subtest("src/ssl.c", test_src__ssl_c);
     }
 
     return done_testing();

@@ -36,7 +36,7 @@ struct rp_generator_t {
         int is_head;
     } up_req;
     h2o_buffer_t *last_content_before_send;
-    h2o_buffer_t *buf_sending;
+    h2o_doublebuffer_t sending;
 };
 
 static h2o_iovec_t rewrite_location(h2o_mem_pool_t *pool, const char *location, size_t location_len, h2o_url_t *match,
@@ -229,33 +229,35 @@ static void do_close(h2o_generator_t *generator, h2o_req_t *req)
     }
 }
 
-static void swap_buffer(h2o_buffer_t **x, h2o_buffer_t **y)
-{
-    h2o_buffer_t *t = *x;
-    *x = *y;
-    *y = t;
-}
-
 static void do_send(struct rp_generator_t *self)
 {
-    assert(self->buf_sending->size == 0);
+    h2o_iovec_t vecs[1];
+    size_t veccnt;
+    int is_eos;
 
-    swap_buffer(&self->buf_sending, self->client != NULL ? &self->client->sock->input : &self->last_content_before_send);
+    assert(self->sending.bytes_inflight == 0);
 
-    if (self->buf_sending->size != 0) {
-        h2o_iovec_t buf = h2o_iovec_init(self->buf_sending->bytes, self->buf_sending->size);
-        h2o_send(self->src_req, &buf, 1, self->client == NULL);
-    } else if (self->client == NULL) {
-        h2o_send(self->src_req, NULL, 0, 1);
+    vecs[0] = h2o_doublebuffer_prepare(&self->sending,
+                                       self->client != NULL ? &self->client->sock->input : &self->last_content_before_send,
+                                       self->src_req->preferred_chunk_size);
+
+    if (self->client == NULL && vecs[0].len == self->sending.buf->size && self->last_content_before_send->size == 0) {
+        veccnt = vecs[0].len != 0 ? 1 : 0;
+        is_eos = 1;
+    } else {
+        if (vecs[0].len == 0)
+            return;
+        veccnt = 1;
+        is_eos = 0;
     }
+    h2o_send(self->src_req, vecs, veccnt, is_eos);
 }
 
 static void do_proceed(h2o_generator_t *generator, h2o_req_t *req)
 {
     struct rp_generator_t *self = (void *)generator;
 
-    h2o_buffer_consume(&self->buf_sending, self->buf_sending->size);
-
+    h2o_doublebuffer_consume(&self->sending);
     do_send(self);
 }
 
@@ -271,52 +273,10 @@ static int on_body(h2o_http1client_t *client, const char *errstr)
         h2o_buffer_init(&self->client->sock->input, &h2o_socket_buffer_prototype);
         self->client = NULL;
     }
-    if (self->buf_sending->size == 0)
+    if (self->sending.bytes_inflight == 0)
         do_send(self);
 
     return 0;
-}
-
-/**
- * extracts path to be pushed from link header (or returns {NULL,0} if none)
- */
-static h2o_iovec_t extract_pushpath_from_link_header(h2o_mem_pool_t *pool, const char *value, size_t value_len, h2o_url_t *base)
-{
-    h2o_iovec_t url;
-    h2o_url_t parsed, resolved;
-
-    { /* extract URL value from: Link: </pushed.css>; rel=preload */
-        h2o_iovec_t iter = h2o_iovec_init(value, value_len), token_value;
-        const char *token;
-        size_t token_len;
-        /* first element should be <URL> */
-        if ((token = h2o_next_token(&iter, ';', &token_len, NULL)) == NULL)
-            goto None;
-        if (!(token_len >= 2 && token[0] == '<' && token[token_len - 1] == '>'))
-            goto None;
-        url = h2o_iovec_init(token + 1, token_len - 2);
-        /* find rel=preload */
-        while ((token = h2o_next_token(&iter, ';', &token_len, &token_value)) != NULL) {
-            if (h2o_lcstris(token, token_len, H2O_STRLIT("rel")) &&
-                h2o_lcstris(token_value.base, token_value.len, H2O_STRLIT("preload")))
-                break;
-        }
-        if (token == NULL)
-            goto None;
-    }
-
-    /* check the authority, and extract absolute path */
-    if (h2o_url_parse_relative(url.base, url.len, &parsed) != 0)
-        goto None;
-    h2o_url_resolve(pool, base, &parsed, &resolved);
-    if (!(base->scheme == resolved.scheme &&
-          (parsed.authority.base == NULL ||
-           h2o_lcstris(base->authority.base, base->authority.len, resolved.authority.base, resolved.authority.len))))
-        goto None;
-
-    return resolved.path;
-None:
-    return (h2o_iovec_t){};
 }
 
 static h2o_http1client_body_cb on_head(h2o_http1client_t *client, const char *errstr, int minor_version, int status,
@@ -325,7 +285,6 @@ static h2o_http1client_body_cb on_head(h2o_http1client_t *client, const char *er
     struct rp_generator_t *self = client->data;
     h2o_req_t *req = self->src_req;
     size_t i;
-    h2o_url_t url_parsed = {};
 
     if (errstr != NULL && errstr != h2o_http1client_error_is_eos) {
         self->client = NULL;
@@ -367,28 +326,8 @@ static h2o_http1client_body_cb on_head(h2o_http1client_t *client, const char *er
                         goto AddHeader;
                 }
                 goto AddHeaderDuped;
-            } else if (token == H2O_TOKEN_LINK && req->version >= 0x200 && !req->res_is_delegated) {
-                if (url_parsed.scheme == NULL) {
-                    if (h2o_url_parse_hostport(req->input.authority.base, req->input.authority.len, &url_parsed.host,
-                                               &url_parsed._port) != NULL) {
-                        url_parsed = (h2o_url_t){
-                            req->input.scheme,    /* scheme */
-                            req->input.authority, /* authority */
-                            {},                   /* host */
-                            req->path_normalized, /* path */
-                            65535                 /* port */
-                        };
-                    }
-                }
-                if (url_parsed.scheme != NULL) {
-                    h2o_iovec_t path =
-                        extract_pushpath_from_link_header(&req->pool, headers[i].value, headers[i].value_len, &url_parsed);
-                    if (path.base != NULL) {
-                        h2o_vector_reserve(&req->pool, (h2o_vector_t *)&req->http2_push_paths,
-                                           sizeof(req->http2_push_paths.entries[0]), req->http2_push_paths.size + 1);
-                        req->http2_push_paths.entries[req->http2_push_paths.size++] = path;
-                    }
-                }
+            } else if (token == H2O_TOKEN_LINK) {
+                h2o_register_push_path_in_link_header(req, headers[i].value, headers[i].value_len);
             }
         /* default behaviour, transfer the header downstream */
         AddHeaderDuped:
@@ -443,7 +382,7 @@ static void on_generator_dispose(void *_self)
         self->client = NULL;
     }
     h2o_buffer_dispose(&self->last_content_before_send);
-    h2o_buffer_dispose(&self->buf_sending);
+    h2o_doublebuffer_dispose(&self->sending);
 }
 
 static struct rp_generator_t *proxy_send_prepare(h2o_req_t *req, int keepalive)
@@ -457,7 +396,7 @@ static struct rp_generator_t *proxy_send_prepare(h2o_req_t *req, int keepalive)
     self->up_req.bufs[1] = req->entity;
     self->up_req.is_head = h2o_memis(req->method.base, req->method.len, H2O_STRLIT("HEAD"));
     h2o_buffer_init(&self->last_content_before_send, &h2o_socket_buffer_prototype);
-    h2o_buffer_init(&self->buf_sending, &h2o_socket_buffer_prototype);
+    h2o_doublebuffer_init(&self->sending, &h2o_socket_buffer_prototype);
 
     return self;
 }
