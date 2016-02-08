@@ -1,6 +1,6 @@
 assert('__FILE__') do
-  file = __FILE__
-  assert_true 'test/t/syntax.rb' == file || 'test\t\syntax.rb' == file
+  file = __FILE__[-9, 9]
+  assert_equal 'syntax.rb', file
 end
 
 assert('__LINE__') do

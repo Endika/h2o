@@ -49,7 +49,7 @@ static void gzip_encoder_free(void *opaque, void *address)
 
 static void expand_buf(h2o_mem_pool_t *pool, iovec_vector_t *bufs)
 {
-    h2o_vector_reserve(pool, (void *)bufs, sizeof(bufs->entries[0]), bufs->size + 1);
+    h2o_vector_reserve(pool, bufs, bufs->size + 1);
     bufs->entries[bufs->size++] = h2o_iovec_init(h2o_mem_alloc_pool(pool, BUF_SIZE), 0);
 }
 
@@ -187,7 +187,7 @@ static void on_setup_ostream(h2o_filter_t *self, h2o_req_t *req, h2o_ostream_t *
         req->preferred_chunk_size = BUF_SIZE;
 
 Next:
-    h2o_setup_next_ostream(self, req, slot);
+    h2o_setup_next_ostream(req, slot);
 }
 
 void h2o_gzip_register(h2o_pathconf_t *pathconf)
